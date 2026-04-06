@@ -1,0 +1,26 @@
+model:
+  base: "runwayml/stable-diffusion-v1-5"
+  ip_adapter: "h94/IP-Adapter"
+  ip_adapter_weight: "models/ip-adapter_sd15.bin"
+
+prompt: "A knight and an orc wrestling fiercely, dynamic pose, cinematic"
+negative_prompt: "blurry, deformed, extra limbs"
+
+generation:
+  num_inference_steps: 30
+  guidance_scale: 7.5
+  image_size: 512
+  seed: 42
+
+dclg:
+  enabled: true
+  alpha: 0.5              # Maximum lambda value
+  tau_threshold: 20       # Turn off guidance after this step
+  target_min_hw: 256      # Target layers min HW (16x16)
+  grad_clip: 1.0          # Gradient clipping value
+  seq_agg: "mean"         # Seq dimension aggregation: "mean" or "max"
+
+experiment:
+  num_images: 5
+  lambda_sweep: [0.0, 2.0]
+  save_attn_maps: true
