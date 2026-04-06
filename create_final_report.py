@@ -7,13 +7,13 @@ def create_final_report():
     # 8 rows (lambdas) x 5 columns (Img, Loss, MapA, MapB, Overlap)
     fig = plt.figure(figsize=(35, 56), facecolor='#ffffff')
     
-    plt.suptitle("DCLG (Decoupled Cross-attention Latent Guidance) Final Result Report: Text-Only Edition", 
+    plt.suptitle("DCLG (Decoupled Cross-attention Latent Guidance) Final Result Report: Complex Attributes", 
                  fontsize=60, fontweight='bold', y=0.988, color='#1a1a1a')
     
     setup_info = (
-        "PROMPT: 'A knight and an orc wrestling fiercely, dynamic pose, cinematic'\n"
-        "CONFIG: Stable Diffusion 1.5 | 30 Steps (DDIM) | Float32 | Target Tokens: Knight (2), Orc (5)\n"
-        "METHOD: Decoupled Cross-attention Latent Guidance (DCLG) | Score Modification Strategy"
+        "PROMPT: 'A knight in red armor and an orc with green skin wrestling fiercely...'\n"
+        "CONFIG: Stable Diffusion 1.5 | 30 Steps (DDIM) | Float32 | Target Tokens: Knight (Index variable), Orc (Index variable)\n"
+        "ANALYSIS: Testing if DCLG prevents Attribute Binding (e.g., Red Orc) by spatially separating the core entities."
     )
     plt.figtext(0.5, 0.965, setup_info, ha="center", fontsize=26, 
                 bbox={"facecolor":"#f8f9fa", "alpha":0.9, "edgecolor":"#dee2e6", "pad":20, "boxstyle":"round,pad=1"})

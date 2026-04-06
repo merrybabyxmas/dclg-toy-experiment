@@ -3,7 +3,7 @@ model:
   ip_adapter: "h94/IP-Adapter"
   ip_adapter_weight: "models/ip-adapter_sd15.bin"
 
-prompt: "A knight and an orc wrestling fiercely, dynamic pose, cinematic"
+prompt: "A knight in red armor and an orc with green skin wrestling fiercely, dynamic pose, cinematic"
 negative_prompt: "blurry, deformed, extra limbs"
 
 generation:
