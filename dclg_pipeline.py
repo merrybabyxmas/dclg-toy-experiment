@@ -12,46 +12,78 @@ class DCLGPipeline:
         self.config = config
         self.device = pipe.device
 
-    def compute_chimera_loss(self, captured_maps: dict, idx_A: int, idx_B: int):
+    def compute_chimera_loss(self, captured_maps: dict):
+        """
+        IP-Adapter용 Chimera Loss: 이미지 토큰 간의 겹침 억제
+        captured_maps: {layer_name: [B*heads, HW, 8]} (4 tokens for A, 4 tokens for B)
+        """
         total_loss = 0.0
         num_layers = len(captured_maps)
         if num_layers == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         for name, attn_map in captured_maps.items():
-            # [2*heads, HW, 77]
+            # CFG assume batch=2, num_heads = shape[0]//2
             num_heads = attn_map.shape[0] // 2
-            cond_attn = attn_map[num_heads:] 
+            cond_attn = attn_map[num_heads:] # [heads, HW, 8]
             
-            map_A = cond_attn[:, :, idx_A].mean(dim=0)
-            map_B = cond_attn[:, :, idx_B].mean(dim=0)
+            # 1. 기사(A)와 오크(B) 이미지 토큰 분리 (각 4토큰)
+            map_A = cond_attn[:, :, 0:4].mean(dim=-1).mean(dim=0) # [HW]
+            map_B = cond_attn[:, :, 4:8].mean(dim=-1).mean(dim=0) # [HW]
             
-            # Sharpening
+            # 2. Sharpening & Normalization
             map_A = torch.pow(map_A, 2)
             map_B = torch.pow(map_B, 2)
-            
-            # Normalization
             map_A = map_A / (map_A.max() + 1e-8)
             map_B = map_B / (map_B.max() + 1e-8)
             
-            # Cosine Similarity
-            map_A_flat = map_A.view(-1)
-            map_B_flat = map_B.view(-1)
-            cos_sim = F.cosine_similarity(map_A_flat, map_B_flat, dim=0)
+            # 3. Cosine Similarity (배타성)
+            cos_sim = F.cosine_similarity(map_A.view(-1), map_B.view(-1), dim=0)
             
-            # Erasure Penalty
+            # 4. Erasure Penalty
             erasure_penalty = torch.relu(0.5 - map_A.max()) + torch.relu(0.5 - map_B.max())
             
             total_loss += (cos_sim + erasure_penalty)
             
         return total_loss / num_layers
 
+    @torch.no_grad()
+    def prepare_ip_adapter_embeddings(self, ip_adapter, image_A, image_B, prompt, negative_prompt):
+        # Image A
+        clip_A = ip_adapter.clip_image_processor(images=image_A, return_tensors="pt").pixel_values
+        embeds_A = ip_adapter.image_encoder(clip_A.to(self.device, dtype=torch.float32)).image_embeds
+        tokens_A = ip_adapter.image_proj_model(embeds_A) # [1, 4, 1024]
+        
+        # Image B
+        clip_B = ip_adapter.clip_image_processor(images=image_B, return_tensors="pt").pixel_values
+        embeds_B = ip_adapter.image_encoder(clip_B.to(self.device, dtype=torch.float32)).image_embeds
+        tokens_B = ip_adapter.image_proj_model(embeds_B) # [1, 4, 1024]
+        
+        # Concatenate: 8 image tokens
+        image_prompt_embeds = torch.cat([tokens_A, tokens_B], dim=1) # [1, 8, 1024]
+        
+        # Uncond image embeds
+        uncond_image_prompt_embeds = ip_adapter.image_proj_model(torch.zeros_like(torch.cat([embeds_A, embeds_B], dim=0)))
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds.view(1, 8, -1)
+        
+        # Text embeds
+        prompt_embeds_, neg_embeds_ = self.pipe.encode_prompt(
+            prompt, self.device, 1, True, negative_prompt
+        )
+        
+        # Merge Text + Image
+        prompt_embeds = torch.cat([prompt_embeds_, image_prompt_embeds], dim=1)
+        negative_prompt_embeds = torch.cat([neg_embeds_, uncond_image_prompt_embeds], dim=1)
+        
+        return prompt_embeds, negative_prompt_embeds
+
     def generate(
         self,
+        ip_adapter,
+        image_A,
+        image_B,
         prompt,
         negative_prompt,
-        idx_A,
-        idx_B,
         lambda_max=10.0,
         seed=42,
         save_intermediate=False,
@@ -61,9 +93,15 @@ class DCLGPipeline:
         guidance_scale = self.config['generation']['guidance_scale']
         tau_threshold = self.config['dclg']['tau_threshold']
         
-        prompt_embeds, negative_prompt_embeds = self.pipe.encode_prompt(
-            prompt, self.device, 1, True, negative_prompt
+        # Embeddings
+        prompt_embeds, negative_prompt_embeds = self.prepare_ip_adapter_embeddings(
+            ip_adapter, image_A, image_B, prompt, negative_prompt
         )
+        
+        # Set IP processors num_tokens=8
+        for name, module in self.pipe.unet.named_modules():
+            if hasattr(module, "processor") and hasattr(module.processor, "num_tokens"):
+                module.processor.num_tokens = 8
         
         generator = torch.Generator(self.device).manual_seed(seed)
         latents = self.pipe.prepare_latents(
@@ -77,11 +115,9 @@ class DCLGPipeline:
         save_steps = [25, 15, 5]
         
         for i, t in enumerate(self.pipe.scheduler.timesteps):
-            # 1. Gradient 추적을 위해 latent 설정
             latents = latents.detach().requires_grad_(True)
             self.hook_manager.clear()
             
-            # 2. Forward pass
             latent_model_input = torch.cat([latents] * 2)
             latent_model_input = self.pipe.scheduler.scale_model_input(latent_model_input, t)
             
@@ -90,37 +126,29 @@ class DCLGPipeline:
                 encoder_hidden_states=torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             ).sample
             
-            # 3. CFG 적용
             noise_pred_uncond, noise_pred_text = noise_pred_out.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             
-            # 4. Guidance (방법 A: Noise Prediction 방향 수정)
             if i < tau_threshold and lambda_max > 0:
-                captured_maps = self.hook_manager.get_captured_maps()
-                loss = self.compute_chimera_loss(captured_maps, idx_A, idx_B)
+                loss = self.compute_chimera_loss(self.hook_manager.captured_maps)
                 losses.append(loss.item())
                 
                 if save_intermediate and i in save_steps:
-                    self.save_debug_maps(captured_maps, idx_A, idx_B, i, lambda_val_label)
+                    self.save_debug_maps(self.hook_manager.captured_maps, i, lambda_val_label)
 
-                # Gradient of Loss w.r.t. Latents
                 grad = torch.autograd.grad(loss, latents)[0]
                 
                 grad_clip = self.config['dclg'].get('grad_clip')
                 if grad_clip:
                     grad = torch.clamp(grad, -grad_clip, grad_clip)
 
-                # [핵심] noise_pred 수정: Loss를 줄이는 방향(-grad)으로 이미지를 밀기 위해 
-                # 노이즈 성분에 +grad를 더해줌 (스케줄러에서 noise_pred를 빼기 때문)
+                # Noise pred modification
                 noise_pred = noise_pred + lambda_max * (1 - i / tau_threshold) * grad
-                
-                # Latent 직접 수정은 하지 않음
                 latents = latents.detach()
             else:
                 losses.append(0.0)
                 latents = latents.detach()
             
-            # 5. 수정된 noise_pred를 사용하여 다음 Step 진행
             latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
             
         with torch.no_grad():
@@ -129,7 +157,7 @@ class DCLGPipeline:
         
         return image, losses
 
-    def save_debug_maps(self, captured_maps, idx_A, idx_B, step, label):
+    def save_debug_maps(self, captured_maps, step, label):
         import matplotlib.pyplot as plt
         if not captured_maps: return
         
@@ -138,10 +166,9 @@ class DCLGPipeline:
         num_heads = attn_map.shape[0] // 2
         cond_attn = attn_map[num_heads:].mean(dim=0)
         
-        map_A = cond_attn[:, idx_A].detach().cpu().float().numpy()
-        map_B = cond_attn[:, idx_B].detach().cpu().float().numpy()
+        map_A = cond_attn[:, 0:4].mean(dim=-1).detach().cpu().float().numpy()
+        map_B = cond_attn[:, 4:8].mean(dim=-1).detach().cpu().float().numpy()
         
-        # 샤프닝 시각화 반영
         map_A = np.power(map_A, 2)
         map_B = np.power(map_B, 2)
         map_A = map_A / (map_A.max() + 1e-8)
@@ -153,17 +180,14 @@ class DCLGPipeline:
         map_B = map_B.reshape(h, w)
         
         os.makedirs("dclg_toy/outputs/attention_maps", exist_ok=True)
-        
         plt.imshow(map_A, cmap='Reds', alpha=0.8)
         plt.colorbar()
         plt.savefig(f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_A.png")
         plt.close()
-        
         plt.imshow(map_B, cmap='Blues', alpha=0.8)
         plt.colorbar()
         plt.savefig(f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_B.png")
         plt.close()
-        
         overlap = (map_A * map_B)
         plt.imshow(overlap, cmap='YlOrRd')
         plt.colorbar()
