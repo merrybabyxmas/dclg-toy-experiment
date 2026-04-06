@@ -3,7 +3,7 @@ import matplotlib.image as mpimg
 import os
 
 def create_final_report():
-    lambdas = ["100.0", "200.0", "300.0", "400.0", "500.0", "600.0"]
+    lambdas = ["0.5", "1.0", "10.0", "20.0", "50.0", "100.0"]
     # 6 rows (lambdas) x 5 columns (Img, Loss, MapA, MapB, Overlap)
     fig = plt.figure(figsize=(35, 42), facecolor='#ffffff')
     
