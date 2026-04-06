@@ -2,10 +2,6 @@
 models/
 ip_adapter/
 
-# Inputs and Outputs
-inputs/
-outputs/
-
 # Python cache
 __pycache__/
 *.py[cod]
@@ -21,3 +17,10 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Media exclusion
+*.mp4
+*.webm
+*.avi
+*.mov
+*.mkv
