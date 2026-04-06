@@ -23,27 +23,23 @@ class DCLGPipeline:
             num_heads = attn_map.shape[0] // 2
             cond_attn = attn_map[num_heads:] 
             
-            # 1. 특정 토큰 맵 추출 및 Head 평균
-            map_A = cond_attn[:, :, idx_A].mean(dim=0) # [HW]
-            map_B = cond_attn[:, :, idx_B].mean(dim=0) # [HW]
+            map_A = cond_attn[:, :, idx_A].mean(dim=0)
+            map_B = cond_attn[:, :, idx_B].mean(dim=0)
             
-            # 2. Attention Sharpening (선명도 강화)
-            # 높은 활성화 지역에 집중하도록 지수를 취함
+            # Sharpening
             map_A = torch.pow(map_A, 2)
             map_B = torch.pow(map_B, 2)
             
-            # 3. Individual Normalization (스케일 통일)
-            # 강도가 낮더라도 공간적으로 겹치면 패널티를 크게 주기 위함
+            # Normalization
             map_A = map_A / (map_A.max() + 1e-8)
             map_B = map_B / (map_B.max() + 1e-8)
             
-            # 4. Cosine Similarity (배타성/직교성 강화)
-            # 두 맵이 서로 다른 곳을 볼수록 Loss가 낮아짐
+            # Cosine Similarity
             map_A_flat = map_A.view(-1)
             map_B_flat = map_B.view(-1)
             cos_sim = F.cosine_similarity(map_A_flat, map_B_flat, dim=0)
             
-            # 5. Erasure Penalty (객체 보존)
+            # Erasure Penalty
             erasure_penalty = torch.relu(0.5 - map_A.max()) + torch.relu(0.5 - map_B.max())
             
             total_loss += (cos_sim + erasure_penalty)
@@ -81,20 +77,24 @@ class DCLGPipeline:
         save_steps = [25, 15, 5]
         
         for i, t in enumerate(self.pipe.scheduler.timesteps):
+            # 1. Gradient 추적을 위해 latent 설정
             latents = latents.detach().requires_grad_(True)
             self.hook_manager.clear()
             
+            # 2. Forward pass
             latent_model_input = torch.cat([latents] * 2)
             latent_model_input = self.pipe.scheduler.scale_model_input(latent_model_input, t)
             
-            noise_pred = self.pipe.unet(
+            noise_pred_out = self.pipe.unet(
                 latent_model_input, t,
                 encoder_hidden_states=torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             ).sample
             
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            # 3. CFG 적용
+            noise_pred_uncond, noise_pred_text = noise_pred_out.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             
+            # 4. Guidance (방법 A: Noise Prediction 방향 수정)
             if i < tau_threshold and lambda_max > 0:
                 captured_maps = self.hook_manager.get_captured_maps()
                 loss = self.compute_chimera_loss(captured_maps, idx_A, idx_B)
@@ -103,19 +103,24 @@ class DCLGPipeline:
                 if save_intermediate and i in save_steps:
                     self.save_debug_maps(captured_maps, idx_A, idx_B, i, lambda_val_label)
 
+                # Gradient of Loss w.r.t. Latents
                 grad = torch.autograd.grad(loss, latents)[0]
                 
                 grad_clip = self.config['dclg'].get('grad_clip')
                 if grad_clip:
                     grad = torch.clamp(grad, -grad_clip, grad_clip)
 
-                # Update latents
-                latents = latents - lambda_max * (1 - i / tau_threshold) * grad
+                # [핵심] noise_pred 수정: Loss를 줄이는 방향(-grad)으로 이미지를 밀기 위해 
+                # 노이즈 성분에 +grad를 더해줌 (스케줄러에서 noise_pred를 빼기 때문)
+                noise_pred = noise_pred + lambda_max * (1 - i / tau_threshold) * grad
+                
+                # Latent 직접 수정은 하지 않음
                 latents = latents.detach()
             else:
                 losses.append(0.0)
                 latents = latents.detach()
             
+            # 5. 수정된 noise_pred를 사용하여 다음 Step 진행
             latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
             
         with torch.no_grad():
@@ -136,7 +141,7 @@ class DCLGPipeline:
         map_A = cond_attn[:, idx_A].detach().cpu().float().numpy()
         map_B = cond_attn[:, idx_B].detach().cpu().float().numpy()
         
-        # 샤프닝 시각화 반영 (제곱)
+        # 샤프닝 시각화 반영
         map_A = np.power(map_A, 2)
         map_B = np.power(map_B, 2)
         map_A = map_A / (map_A.max() + 1e-8)
