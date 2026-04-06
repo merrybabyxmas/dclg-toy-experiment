@@ -1,0 +1,406 @@
+"""
+Video DCLG Pipeline — AnimateDiff + Cosine Similarity Loss on Text Cross-Attention.
+
+Extends the original Phase 1 DCLG to video:
+- AnimateDiff motion adapter on SD 1.5 backbone
+- Same cosine similarity loss + erasure penalty
+- Gradient guidance on noise_pred (not latents)
+- Captures cross-attention maps from up_blocks attn2 layers
+"""
+import torch
+import torch.nn.functional as F
+from diffusers import AnimateDiffPipeline, MotionAdapter, DDIMScheduler, AutoencoderKL
+from PIL import Image
+import numpy as np
+
+
+class VideoSaveAttnProcessor:
+    """Captures text cross-attention maps, compatible with AnimateDiff's
+    [B*F*heads, HW, 77] shaped attention tensors."""
+
+    def __init__(self):
+        self.attn_map = None
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, **kwargs):
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, kwargs.get("temb"))
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+
+        # Only capture text cross-attention (77 tokens), skip self-attention
+        if attention_probs.shape[-1] <= 77:
+            self.attn_map = attention_probs  # [B*F*heads, HW, seq_len]
+
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
+class VideoHookManager:
+    """Hook manager for AnimateDiff UNet cross-attention layers."""
+
+    def __init__(self, target_min_hw=256):
+        self.target_min_hw = target_min_hw
+        self.processors = {}
+
+    def register_hooks(self, unet):
+        for name, module in unet.named_modules():
+            # Target up_blocks cross-attention (attn2), skip motion_modules
+            if ("up_blocks" in name and "attn2" in name
+                    and "motion_modules" not in name
+                    and hasattr(module, "processor")):
+                if not name.endswith(".attn2"):
+                    continue
+                proc = VideoSaveAttnProcessor()
+                module.set_processor(proc)
+                self.processors[name] = proc
+
+    def get_captured_maps(self):
+        maps = {}
+        for name, proc in self.processors.items():
+            if proc.attn_map is not None and proc.attn_map.shape[1] >= self.target_min_hw:
+                maps[name] = proc.attn_map
+        return maps
+
+    def clear(self):
+        for proc in self.processors.values():
+            proc.attn_map = None
+
+
+class VideoDCLGPipeline:
+    """AnimateDiff pipeline with DCLG cosine similarity guidance."""
+
+    def __init__(self, config, device="cuda"):
+        self.config = config
+        self.device = device
+        self.pipe = None
+        self.hook_manager = None
+
+    def load_pipeline(self):
+        print("Loading AnimateDiff pipeline...")
+        adapter = MotionAdapter.from_pretrained(
+            "guoyww/animatediff-motion-adapter-v1-5-3",
+            torch_dtype=torch.float16,
+        )
+        vae = AutoencoderKL.from_pretrained(
+            "stabilityai/sd-vae-ft-mse",
+            torch_dtype=torch.float16,
+        )
+        self.pipe = AnimateDiffPipeline.from_pretrained(
+            "SG161222/Realistic_Vision_V5.1_noVAE",
+            motion_adapter=adapter,
+            vae=vae,
+            torch_dtype=torch.float16,
+        ).to(self.device)
+
+        self.pipe.safety_checker = None
+        self.pipe.requires_safety_checker = False
+        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self.pipe.vae.enable_slicing()
+
+        # Register attention hooks
+        self.hook_manager = VideoHookManager(
+            target_min_hw=self.config['dclg']['target_min_hw']
+        )
+        self.hook_manager.register_hooks(self.pipe.unet)
+        print(f"  Hooked {len(self.hook_manager.processors)} cross-attention layers")
+
+    def get_token_index(self, prompt, target_word):
+        inputs = self.pipe.tokenizer(prompt)
+        tokens = self.pipe.tokenizer.convert_ids_to_tokens(inputs['input_ids'])
+        for i, token in enumerate(tokens):
+            clean = token.replace('</w>', '').lower()
+            if clean == target_word.lower():
+                return i
+        return -1
+
+    def compute_chimera_loss(self, captured_maps, idx_A, idx_B, num_frames):
+        """Cosine similarity loss across video frames.
+
+        captured_maps values have shape [2*F*heads, HW, 77].
+        We take the conditional half, reshape to [F, heads, HW, 77],
+        average over heads and frames, then compute cosine similarity.
+        """
+        total_loss = 0.0
+        num_layers = len(captured_maps)
+        if num_layers == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        for name, attn_map in captured_maps.items():
+            # attn_map: [2*F*heads, HW, seq_len]
+            total_batch_heads = attn_map.shape[0]
+            half = total_batch_heads // 2
+            cond_attn = attn_map[half:]  # [F*heads, HW, seq_len]
+
+            # Average over all frames and heads
+            map_A = cond_attn[:, :, idx_A].mean(dim=0)  # [HW]
+            map_B = cond_attn[:, :, idx_B].mean(dim=0)  # [HW]
+
+            # Sharpening
+            map_A = torch.pow(map_A, 2)
+            map_B = torch.pow(map_B, 2)
+
+            # Normalize
+            map_A = map_A / (map_A.max() + 1e-8)
+            map_B = map_B / (map_B.max() + 1e-8)
+
+            # Cosine similarity (minimize overlap)
+            cos_sim = F.cosine_similarity(map_A.view(-1), map_B.view(-1), dim=0)
+
+            # Erasure penalty (prevent entity disappearance)
+            erasure = torch.relu(0.5 - map_A.max()) + torch.relu(0.5 - map_B.max())
+
+            total_loss += (cos_sim + erasure)
+
+        return total_loss / num_layers
+
+    def compute_per_frame_loss(self, captured_maps, idx_A, idx_B, num_frames, num_heads):
+        """Per-frame cosine similarity loss for stronger per-frame guidance."""
+        total_loss = 0.0
+        num_layers = len(captured_maps)
+        if num_layers == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        for name, attn_map in captured_maps.items():
+            total_batch_heads = attn_map.shape[0]
+            half = total_batch_heads // 2
+            cond_attn = attn_map[half:]  # [F*heads, HW, seq_len]
+
+            # Reshape to [F, heads, HW, seq_len]
+            hw = cond_attn.shape[1]
+            seq_len = cond_attn.shape[2]
+            cond_attn = cond_attn.view(num_frames, num_heads, hw, seq_len)
+
+            # Per-frame loss
+            frame_loss = 0.0
+            for f in range(num_frames):
+                frame_attn = cond_attn[f]  # [heads, HW, seq_len]
+                map_A = frame_attn[:, :, idx_A].mean(dim=0)  # [HW]
+                map_B = frame_attn[:, :, idx_B].mean(dim=0)
+
+                map_A = torch.pow(map_A, 2)
+                map_B = torch.pow(map_B, 2)
+                map_A = map_A / (map_A.max() + 1e-8)
+                map_B = map_B / (map_B.max() + 1e-8)
+
+                cos_sim = F.cosine_similarity(map_A.view(-1), map_B.view(-1), dim=0)
+                erasure = torch.relu(0.5 - map_A.max()) + torch.relu(0.5 - map_B.max())
+                frame_loss += (cos_sim + erasure)
+
+            total_loss += frame_loss / num_frames
+
+        return total_loss / num_layers
+
+    def generate(
+        self,
+        prompt,
+        negative_prompt,
+        entity_A_word,
+        entity_B_word,
+        lambda_max=50.0,
+        seed=42,
+        num_frames=16,
+        per_frame_loss=False,
+    ):
+        """Generate video with DCLG guidance.
+
+        Args:
+            prompt: Text prompt
+            negative_prompt: Negative prompt
+            entity_A_word: Word for entity A (e.g., "knight")
+            entity_B_word: Word for entity B (e.g., "orc")
+            lambda_max: Maximum guidance strength
+            seed: Random seed
+            num_frames: Number of video frames
+            per_frame_loss: If True, compute loss per-frame instead of averaged
+        """
+        num_steps = self.config['generation']['num_inference_steps']
+        guidance_scale = self.config['generation']['guidance_scale']
+        tau_threshold = self.config['dclg']['tau_threshold']
+        grad_clip = self.config['dclg'].get('grad_clip', 1.0)
+        img_size = self.config['generation']['image_size']
+
+        # Token indices
+        idx_A = self.get_token_index(prompt, entity_A_word)
+        idx_B = self.get_token_index(prompt, entity_B_word)
+        tokens = self.pipe.tokenizer(prompt)
+        token_strs = self.pipe.tokenizer.convert_ids_to_tokens(tokens['input_ids'])
+        print(f"  Tokens: {list(enumerate(token_strs))}")
+        print(f"  {entity_A_word} idx: {idx_A}, {entity_B_word} idx: {idx_B}")
+
+        if idx_A < 0 or idx_B < 0:
+            raise ValueError(f"Could not find token indices: {entity_A_word}={idx_A}, {entity_B_word}={idx_B}")
+
+        # Encode prompt
+        text_cond, text_uncond = self.pipe.encode_prompt(
+            prompt, self.device, 1, True, negative_prompt
+        )
+
+        # Prepare latents [B, C, F, H, W]
+        device = torch.device(self.device)
+        generator = torch.Generator(device).manual_seed(seed)
+        latent_h = img_size // 8
+        latent_w = img_size // 8
+        latents = torch.randn(
+            1, 4, num_frames, latent_h, latent_w,
+            generator=generator, device=device, dtype=torch.float32,
+        )
+
+        self.pipe.scheduler.set_timesteps(num_steps, device=device)
+
+        # Get num_heads from UNet
+        # SD 1.5 has 8 heads in most attention layers
+        num_heads = 8
+
+        losses = []
+        for i, t in enumerate(self.pipe.scheduler.timesteps):
+            apply_guidance = (i < tau_threshold and lambda_max > 0)
+
+            latents = latents.detach().to(torch.float32)
+            if apply_guidance:
+                latents = latents.requires_grad_(True)
+
+            self.hook_manager.clear()
+
+            # CFG: duplicate latents
+            latent_input = torch.cat([latents] * 2)
+            latent_input = self.pipe.scheduler.scale_model_input(latent_input, t)
+            enc_hs = torch.cat([text_uncond, text_cond], dim=0).to(torch.float32)
+
+            # UNet forward
+            noise_pred_out = self.pipe.unet(
+                latent_input.to(self.pipe.unet.dtype), t,
+                encoder_hidden_states=enc_hs.to(self.pipe.unet.dtype),
+            ).sample.to(torch.float32)
+
+            # CFG
+            noise_pred_uncond, noise_pred_text = noise_pred_out.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            if apply_guidance:
+                captured = self.hook_manager.get_captured_maps()
+
+                if per_frame_loss:
+                    loss = self.compute_per_frame_loss(
+                        captured, idx_A, idx_B, num_frames, num_heads
+                    )
+                else:
+                    loss = self.compute_chimera_loss(
+                        captured, idx_A, idx_B, num_frames
+                    )
+                losses.append(loss.item())
+
+                grad = torch.autograd.grad(loss, latents)[0]
+                if grad_clip:
+                    grad = torch.clamp(grad, -grad_clip, grad_clip)
+
+                decay = 1.0 - i / tau_threshold
+                noise_pred = noise_pred + lambda_max * decay * grad
+                latents = latents.detach()
+            else:
+                losses.append(0.0)
+                latents = latents.detach()
+
+            latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
+
+        # Decode video
+        with torch.no_grad():
+            latents_decode = latents.to(self.pipe.vae.dtype)
+            # AnimateDiff latents: [B, C, F, H, W] → decode each frame
+            frames = self.decode_latents(latents_decode)
+
+        # Get final attention maps for visualization
+        final_maps = self._get_final_maps(latents, text_cond, text_uncond,
+                                           self.pipe.scheduler.timesteps[-1],
+                                           idx_A, idx_B, num_frames)
+
+        return frames, losses, final_maps
+
+    def decode_latents(self, latents):
+        """Decode [B, C, F, H, W] latents to list of PIL images."""
+        # latents: [1, 4, F, H, W]
+        latents = latents / self.pipe.vae.config.scaling_factor
+        batch_size, channels, num_frames, height, width = latents.shape
+
+        # Reshape to [B*F, C, H, W] for VAE
+        latents = latents.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames, channels, height, width
+        )
+
+        frames = []
+        # Decode in chunks to avoid OOM
+        chunk_size = 4
+        for i in range(0, latents.shape[0], chunk_size):
+            chunk = latents[i:i + chunk_size]
+            decoded = self.pipe.vae.decode(chunk).sample
+            decoded = (decoded / 2 + 0.5).clamp(0, 1)
+            decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
+            decoded = (decoded * 255).round().astype(np.uint8)
+            for j in range(decoded.shape[0]):
+                frames.append(Image.fromarray(decoded[j]))
+
+        return frames
+
+    def _get_final_maps(self, latents, text_cond, text_uncond, t, idx_A, idx_B, num_frames):
+        """Run one more forward pass to get clean attention maps for visualization."""
+        with torch.no_grad():
+            self.hook_manager.clear()
+            latent_input = torch.cat([latents] * 2)
+            latent_input = self.pipe.scheduler.scale_model_input(latent_input, t)
+            enc_hs = torch.cat([text_uncond, text_cond], dim=0).to(torch.float32)
+            self.pipe.unet(
+                latent_input.to(self.pipe.unet.dtype), t,
+                encoder_hidden_states=enc_hs.to(self.pipe.unet.dtype),
+            )
+
+        captured = self.hook_manager.get_captured_maps()
+        if not captured:
+            return {}
+
+        name = list(captured.keys())[-1]
+        attn_map = captured[name]
+        half = attn_map.shape[0] // 2
+        cond_attn = attn_map[half:]  # [F*heads, HW, 77]
+
+        map_A = cond_attn[:, :, idx_A].mean(dim=0).cpu().float().numpy()
+        map_B = cond_attn[:, :, idx_B].mean(dim=0).cpu().float().numpy()
+
+        return {'map_A': map_A, 'map_B': map_B}
