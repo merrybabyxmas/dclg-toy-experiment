@@ -115,19 +115,39 @@ class DCLGPipeline:
         return image, losses
 
     def save_debug_maps(self, captured_maps, idx_A, idx_B, step, label):
-        from .utils import visualize_attn_map, visualize_overlap
+        import matplotlib.pyplot as plt
         if not captured_maps: return
         
-        # 가장 해상도가 높은 마지막 레이어 선택
         name = list(captured_maps.keys())[-1]
         attn_map = captured_maps[name]
         num_heads = attn_map.shape[0] // 2
         cond_attn = attn_map[num_heads:].mean(dim=0)
         
-        map_A = cond_attn[:, idx_A]
-        map_B = cond_attn[:, idx_B]
+        map_A = cond_attn[:, idx_A].detach().cpu().float().numpy()
+        map_B = cond_attn[:, idx_B].detach().cpu().float().numpy()
+        
+        hw = map_A.shape[0]
+        h = w = int(np.sqrt(hw))
+        map_A = map_A.reshape(h, w)
+        map_B = map_B.reshape(h, w)
         
         os.makedirs("dclg_toy/outputs/attention_maps", exist_ok=True)
-        visualize_attn_map(map_A, f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_A.png")
-        visualize_attn_map(map_B, f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_B.png")
-        visualize_overlap(map_A, map_B, f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_overlap.png")
+        
+        # Knight (A) - Red scale
+        plt.imshow(map_A, cmap='Reds', alpha=0.8)
+        plt.colorbar()
+        plt.savefig(f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_A.png")
+        plt.close()
+        
+        # Orc (B) - Blues scale
+        plt.imshow(map_B, cmap='Blues', alpha=0.8)
+        plt.colorbar()
+        plt.savefig(f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_B.png")
+        plt.close()
+        
+        # Overlap
+        overlap = (map_A * map_B)
+        plt.imshow(overlap, cmap='YlOrRd')
+        plt.colorbar()
+        plt.savefig(f"dclg_toy/outputs/attention_maps/step{step}_lambda{label}_overlap.png")
+        plt.close()
