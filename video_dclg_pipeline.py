@@ -1,11 +1,13 @@
 """
-Video DCLG Pipeline — AnimateDiff + Cosine Similarity Loss on Text Cross-Attention.
+Video DCLG Pipeline — AnimateDiff + 3-Zone Masked Spatial Loss.
 
 Extends the original Phase 1 DCLG to video:
 - AnimateDiff motion adapter on SD 1.5 backbone
-- Same cosine similarity loss + erasure penalty
+- 3-zone masked loss: leakage + co-activation + erasure penalty
 - Gradient guidance on noise_pred (not latents)
 - Captures cross-attention maps from up_blocks attn2 layers
+
+Iter 2: Replace global cosine similarity with spatial-aware masked loss.
 """
 import torch
 import torch.nn.functional as F
@@ -219,7 +221,7 @@ class VideoHookManager:
 
 
 class VideoDCLGPipeline:
-    """AnimateDiff pipeline with DCLG cosine similarity guidance."""
+    """AnimateDiff pipeline with DCLG 3-zone masked guidance."""
 
     def __init__(self, config, device="cuda"):
         self.config = config
@@ -268,7 +270,7 @@ class VideoDCLGPipeline:
         return -1
 
     def compute_chimera_loss(self, captured_maps, idx_A, idx_B, num_frames):
-        """Cosine similarity loss across video frames.
+        """Cosine similarity loss across video frames (legacy, kept for fallback).
 
         captured_maps values have shape [2*F*heads, HW, 77].
         We take the conditional half, reshape to [F, heads, HW, 77],
@@ -308,7 +310,7 @@ class VideoDCLGPipeline:
         return total_loss / num_layers
 
     def compute_per_frame_loss(self, captured_maps, idx_A, idx_B, num_frames, num_heads):
-        """Per-frame cosine similarity loss for stronger per-frame guidance."""
+        """Per-frame cosine similarity loss for stronger per-frame guidance (legacy)."""
         total_loss = 0.0
         num_layers = len(captured_maps)
         if num_layers == 0:
@@ -344,6 +346,115 @@ class VideoDCLGPipeline:
 
         return total_loss / num_layers
 
+    def compute_masked_loss(self, captured_maps, idx_A, idx_B, masks, num_frames, num_heads):
+        """3-zone spatially-aware DCLG loss (Iter 2).
+
+        Core philosophy: allow physical interaction, prevent identity overlap.
+
+        Args:
+            captured_maps: dict of {name: attn_map [2*F*heads, HW, seq_len]}
+            idx_A, idx_B: token indices for entity A and B
+            masks: dict with keys 'excl_A', 'excl_B', 'shared' each [F, 1, H_lat, W_lat]
+            num_frames: number of video frames
+            num_heads: number of attention heads
+
+        Loss components:
+            1. Leakage Loss: penalize entity A attention in B's exclusive zone (and vice versa)
+            2. Co-activation Loss: penalize simultaneous A+B activation in shared zone (chimera)
+            3. Activation Reward: prevent entity erasure (F2 failure mode)
+        """
+        excl_A_mask = masks['excl_A']  # [F, 1, H_lat, W_lat]
+        excl_B_mask = masks['excl_B']
+        shared_mask = masks['shared']
+
+        total_loss = 0.0
+        num_layers = len(captured_maps)
+        if num_layers == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        for name, attn_map in captured_maps.items():
+            total_batch_heads = attn_map.shape[0]
+            half = total_batch_heads // 2
+            cond_attn = attn_map[half:]  # [F*heads, HW, seq_len]
+
+            hw = cond_attn.shape[1]
+            seq_len = cond_attn.shape[2]
+
+            # Infer actual num_heads per frame
+            total_f_heads = cond_attn.shape[0]
+            actual_heads = total_f_heads // num_frames
+            if actual_heads == 0:
+                continue
+
+            # Reshape to [F, heads, HW, seq_len]
+            try:
+                cond_4d = cond_attn.view(num_frames, actual_heads, hw, seq_len)
+            except RuntimeError:
+                continue
+
+            # Compute HW spatial side (attention maps are square)
+            hw_side = int(hw ** 0.5)
+            if hw_side * hw_side != hw:
+                # Non-square attention map; fallback to global loss for this layer
+                continue
+
+            layer_loss = 0.0
+            for f in range(num_frames):
+                frame_attn = cond_4d[f]  # [heads, HW, seq_len]
+
+                # Head-averaged attention maps for tokens A and B
+                map_A_f = frame_attn[:, :, idx_A].mean(dim=0)  # [HW]
+                map_B_f = frame_attn[:, :, idx_B].mean(dim=0)  # [HW]
+
+                # Get zone masks for this frame → resize to attention map resolution
+                excl_A_f = excl_A_mask[f, 0]  # [H_lat, W_lat]
+                excl_B_f = excl_B_mask[f, 0]
+                shared_f  = shared_mask[f, 0]
+
+                lat_H, lat_W = excl_A_f.shape
+                if lat_H != hw_side or lat_W != hw_side:
+                    excl_A_f = F.interpolate(
+                        excl_A_f.unsqueeze(0).unsqueeze(0),
+                        size=(hw_side, hw_side), mode='nearest'
+                    ).squeeze()
+                    excl_B_f = F.interpolate(
+                        excl_B_f.unsqueeze(0).unsqueeze(0),
+                        size=(hw_side, hw_side), mode='nearest'
+                    ).squeeze()
+                    shared_f = F.interpolate(
+                        shared_f.unsqueeze(0).unsqueeze(0),
+                        size=(hw_side, hw_side), mode='nearest'
+                    ).squeeze()
+
+                # Flatten masks to [HW] and move to device
+                excl_A_f = excl_A_f.to(self.device).view(-1).float()
+                excl_B_f = excl_B_f.to(self.device).view(-1).float()
+                shared_f  = shared_f.to(self.device).view(-1).float()
+
+                # 1. Leakage Loss: penalize A leaking into B's exclusive zone (& vice versa)
+                loss_leak_A = (map_A_f * excl_B_f).mean()
+                loss_leak_B = (map_B_f * excl_A_f).mean()
+
+                # 2. Co-activation Loss: penalize chimera in shared zone
+                co_act_map = (map_A_f * shared_f) * (map_B_f * shared_f)
+                loss_coact = co_act_map.sum() / (shared_f.sum() + 1e-8)
+
+                # 3. Activation Reward: prevent entity erasure (F2)
+                # Each entity must activate in its full region (exclusive + shared)
+                full_mask_A = torch.clamp(excl_A_f + shared_f, 0.0, 1.0)
+                full_mask_B = torch.clamp(excl_B_f + shared_f, 0.0, 1.0)
+                loss_act = (torch.relu(0.3 - (map_A_f * full_mask_A).max()) +
+                            torch.relu(0.3 - (map_B_f * full_mask_B).max()))
+
+                frame_loss = (loss_leak_A + loss_leak_B) + 0.3 * loss_coact + 0.5 * loss_act
+                layer_loss += frame_loss / num_frames
+
+            total_loss += layer_loss
+
+        if num_layers == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        return total_loss / num_layers
+
     def generate(
         self,
         prompt,
@@ -354,6 +465,9 @@ class VideoDCLGPipeline:
         seed=42,
         num_frames=16,
         per_frame_loss=False,
+        bboxes_A=None,
+        bboxes_B=None,
+        collision_frames=(6, 7),
     ):
         """Generate video with DCLG guidance.
 
@@ -365,7 +479,16 @@ class VideoDCLGPipeline:
             lambda_max: Maximum guidance strength
             seed: Random seed
             num_frames: Number of video frames
-            per_frame_loss: If True, compute loss per-frame instead of averaged
+            per_frame_loss: If True, compute legacy per-frame cosine loss
+            bboxes_A: list of [x1,y1,x2,y2] per frame for entity A (enables masked loss)
+            bboxes_B: list of [x1,y1,x2,y2] per frame for entity B
+            collision_frames: tuple of frame indices where entities overlap
+
+        Returns:
+            frames: list of PIL images
+            losses: list of per-step loss values
+            final_maps: dict with attention maps for visualization
+            debug_info: dict with grad_norms, masks
         """
         num_steps = self.config['generation']['num_inference_steps']
         guidance_scale = self.config['generation']['guidance_scale']
@@ -401,11 +524,28 @@ class VideoDCLGPipeline:
 
         self.pipe.scheduler.set_timesteps(num_steps, device=device)
 
-        # Get num_heads from UNet
         # SD 1.5 has 8 heads in most attention layers
         num_heads = 8
 
+        # Create 3-zone masks from BBox trajectories (if provided)
+        masks = None
+        if bboxes_A is not None and bboxes_B is not None:
+            excl_A, excl_B, shared = _create_3zone_masks(
+                bboxes_A, bboxes_B,
+                (img_size, img_size),
+                (latent_h, latent_w),
+                collision_frames=collision_frames,
+            )
+            masks = {'excl_A': excl_A, 'excl_B': excl_B, 'shared': shared}
+            print(f"  Using 3-zone masked loss (excl_A, excl_B, shared zones)")
+        else:
+            print(f"  Using {'per-frame' if per_frame_loss else 'global'} cosine loss (no bbox masks)")
+
         losses = []
+        grad_norms = []
+        attn_maps_at_step_t = None
+        target_step_for_debug = 5
+
         for i, t in enumerate(self.pipe.scheduler.timesteps):
             apply_guidance = (i < tau_threshold and lambda_max > 0)
 
@@ -437,13 +577,23 @@ class VideoDCLGPipeline:
             if apply_guidance:
                 captured = self.hook_manager.get_captured_maps()
 
+                # Capture attention maps at target step for debug GIF
+                if i == target_step_for_debug and captured:
+                    attn_maps_at_step_t = {k: v.detach().clone() for k, v in captured.items()}
+
                 if not captured:
                     losses.append(0.0)
+                    grad_norms.append(0.0)
                     latents = latents.detach()
                     latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
                     continue
 
-                if per_frame_loss:
+                # Select loss function: masked > per_frame > global
+                if masks is not None:
+                    loss = self.compute_masked_loss(
+                        captured, idx_A, idx_B, masks, num_frames, num_heads
+                    )
+                elif per_frame_loss:
                     loss = self.compute_per_frame_loss(
                         captured, idx_A, idx_B, num_frames, num_heads
                     )
@@ -456,13 +606,15 @@ class VideoDCLGPipeline:
                 grad = torch.autograd.grad(loss, latents, allow_unused=True)[0]
                 if grad is None:
                     print(f"    Step {i}: grad is None (no gradient flow)")
+                    grad_norms.append(0.0)
                     latents = latents.detach()
                     latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
                     continue
 
-                grad_norm = grad.norm().item()
+                gn = grad.norm().item()
+                grad_norms.append(gn)
                 if i == 0 or i == tau_threshold - 1:
-                    print(f"    Step {i}: loss={loss.item():.4f}, grad_norm={grad_norm:.6f}")
+                    print(f"    Step {i}: loss={loss.item():.4f}, grad_norm={gn:.6f}")
 
                 if grad_clip:
                     grad = torch.clamp(grad, -grad_clip, grad_clip)
@@ -472,6 +624,7 @@ class VideoDCLGPipeline:
                 latents = latents.detach()
             else:
                 losses.append(0.0)
+                grad_norms.append(0.0)
                 latents = latents.detach()
 
             latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
@@ -479,7 +632,6 @@ class VideoDCLGPipeline:
         # Decode video
         with torch.no_grad():
             latents_decode = latents.to(self.pipe.vae.dtype)
-            # AnimateDiff latents: [B, C, F, H, W] → decode each frame
             frames = self.decode_latents(latents_decode)
 
         # Get final attention maps for visualization
@@ -487,7 +639,13 @@ class VideoDCLGPipeline:
                                            self.pipe.scheduler.timesteps[-1],
                                            idx_A, idx_B, num_frames)
 
-        return frames, losses, final_maps
+        debug_info = {
+            'grad_norms': grad_norms,
+            'masks': masks,
+            'attn_maps_at_step_t': attn_maps_at_step_t,
+        }
+
+        return frames, losses, final_maps, debug_info
 
     def decode_latents(self, latents):
         """Decode [B, C, F, H, W] latents to list of PIL images."""
@@ -536,7 +694,30 @@ class VideoDCLGPipeline:
         half = attn_map.shape[0] // 2
         cond_attn = attn_map[half:]  # [F*heads, HW, 77]
 
+        # Frame-averaged maps
         map_A = cond_attn[:, :, idx_A].mean(dim=0).cpu().float().numpy()
         map_B = cond_attn[:, :, idx_B].mean(dim=0).cpu().float().numpy()
 
-        return {'map_A': map_A, 'map_B': map_B}
+        # Per-frame maps for chimera heatmap visualization
+        hw = cond_attn.shape[1]
+        total_f_heads = cond_attn.shape[0]
+        actual_heads = total_f_heads // num_frames
+        per_frame_A = []
+        per_frame_B = []
+        try:
+            cond_4d = cond_attn.view(num_frames, actual_heads, hw, -1)
+            for f in range(num_frames):
+                pA = cond_4d[f, :, :, idx_A].mean(0).cpu().float().numpy()
+                pB = cond_4d[f, :, :, idx_B].mean(0).cpu().float().numpy()
+                per_frame_A.append(pA)
+                per_frame_B.append(pB)
+        except Exception:
+            per_frame_A = [map_A] * num_frames
+            per_frame_B = [map_B] * num_frames
+
+        return {
+            'map_A': map_A,
+            'map_B': map_B,
+            'per_frame_A': per_frame_A,
+            'per_frame_B': per_frame_B,
+        }
