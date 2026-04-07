@@ -649,13 +649,25 @@ def main():
             'entity_A': 'red',
             'entity_B': 'blue',
         },
+        {
+            'name': 'swordfight',
+            'prompt': "A samurai in black robes and a ninja in white robes engaged in an intense swordfight, fast motion blur, dramatic lighting",
+            'entity_A': 'samurai',
+            'entity_B': 'ninja',
+        },
+        {
+            'name': 'boxing',
+            'prompt': "A boxer wearing red gloves and a boxer wearing blue gloves exchanging powerful punches in a boxing ring, action shot",
+            'entity_A': 'red',
+            'entity_B': 'blue',
+        },
+        {
+            'name': 'catdog',
+            'prompt': "A golden retriever dog and an orange tabby cat playfully chasing each other around a living room, cute and energetic",
+            'entity_A': 'dog',
+            'entity_B': 'cat',
+        },
     ]
-    # Uncomment below to add more scenarios:
-    # scenarios += [
-    #     {'name': 'swordfight', ...},
-    #     {'name': 'boxing', ...},
-    #     {'name': 'catdog', ...},
-    # ]
 
     # Iter 2: full lambda sweep [0, 10, 50, 100]
     lambda_sweep = [0.0, 10.0, 50.0, 100.0]
