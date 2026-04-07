@@ -14,9 +14,96 @@ from PIL import Image
 import numpy as np
 
 
+def bbox_to_mask(bbox, frame_resolution, latent_resolution):
+    """Convert a single BBox [x1, y1, x2, y2] to a binary mask at latent resolution.
+
+    Args:
+        bbox: [x1, y1, x2, y2] in frame pixel coords
+        frame_resolution: (H, W) of the output frame
+        latent_resolution: (H_lat, W_lat) for the mask
+
+    Returns:
+        mask: float32 tensor of shape [H_lat, W_lat]
+    """
+    x1, y1, x2, y2 = bbox
+    frame_H, frame_W = frame_resolution
+    lat_H, lat_W = latent_resolution
+
+    scale_x = lat_W / frame_W
+    scale_y = lat_H / frame_H
+
+    lx1 = int(x1 * scale_x)
+    ly1 = int(y1 * scale_y)
+    lx2 = int(x2 * scale_x)
+    ly2 = int(y2 * scale_y)
+
+    # Clamp to valid range
+    lx1 = max(0, min(lx1, lat_W - 1))
+    ly1 = max(0, min(ly1, lat_H - 1))
+    lx2 = max(lx1 + 1, min(lx2, lat_W))
+    ly2 = max(ly1 + 1, min(ly2, lat_H))
+
+    mask = torch.zeros(lat_H, lat_W, dtype=torch.float32)
+    mask[ly1:ly2, lx1:lx2] = 1.0
+    return mask
+
+
+def _create_3zone_masks(bboxes_A, bboxes_B, frame_resolution, latent_resolution,
+                        collision_frames=(6, 7)):
+    """Create per-frame 3-zone masks for entity A and entity B.
+
+    For collision frames: produces exclusive_A, shared, exclusive_B zones.
+    For non-collision frames: shared zone is all zeros (no overlap).
+
+    Args:
+        bboxes_A: list of [x1, y1, x2, y2] for entity A, one per frame
+        bboxes_B: list of [x1, y1, x2, y2] for entity B, one per frame
+        frame_resolution: (H, W) of the generated video frames
+        latent_resolution: (H_lat, W_lat) of the UNet latent space
+        collision_frames: frame indices where entities physically overlap
+
+    Returns:
+        mask_exclusive_A: [num_frames, 1, H_lat, W_lat] float32
+        mask_exclusive_B: [num_frames, 1, H_lat, W_lat] float32
+        mask_shared_AB:   [num_frames, 1, H_lat, W_lat] float32
+    """
+    num_frames = len(bboxes_A)
+    assert len(bboxes_B) == num_frames, "bboxes_A and bboxes_B must have same length"
+
+    lat_H, lat_W = latent_resolution
+    excl_A_frames = []
+    excl_B_frames = []
+    shared_frames = []
+
+    for f in range(num_frames):
+        mask_A_raw = bbox_to_mask(bboxes_A[f], frame_resolution, latent_resolution)
+        mask_B_raw = bbox_to_mask(bboxes_B[f], frame_resolution, latent_resolution)
+
+        if f in collision_frames:
+            mask_intersection = mask_A_raw * mask_B_raw
+            excl_A = torch.clamp(mask_A_raw - mask_intersection, 0.0, 1.0)
+            excl_B = torch.clamp(mask_B_raw - mask_intersection, 0.0, 1.0)
+            shared  = mask_intersection
+        else:
+            # Simple left/right split — no shared zone
+            excl_A = mask_A_raw
+            excl_B = mask_B_raw
+            shared  = torch.zeros(lat_H, lat_W, dtype=torch.float32)
+
+        excl_A_frames.append(excl_A.unsqueeze(0))   # [1, H, W]
+        excl_B_frames.append(excl_B.unsqueeze(0))
+        shared_frames.append(shared.unsqueeze(0))
+
+    mask_exclusive_A = torch.stack(excl_A_frames, dim=0)   # [F, 1, H, W]
+    mask_exclusive_B = torch.stack(excl_B_frames, dim=0)
+    mask_shared_AB   = torch.stack(shared_frames, dim=0)
+
+    return mask_exclusive_A, mask_exclusive_B, mask_shared_AB
+
+
 class VideoSaveAttnProcessor:
-    """Captures text cross-attention maps, compatible with AnimateDiff's
-    [B*F*heads, HW, 77] shaped attention tensors."""
+    """Captures text cross-attention maps with float32 attention computation
+    for numerical stability in gradient tracking."""
 
     def __init__(self):
         self.attn_map = None
@@ -36,7 +123,9 @@ class VideoSaveAttnProcessor:
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
         query = attn.to_q(hidden_states)
 
@@ -48,19 +137,43 @@ class VideoSaveAttnProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        # Reshape to [B, heads, HW, head_dim]
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # Only capture text cross-attention (77 tokens), skip self-attention
+        # Compute attention in float32 for gradient stability
+        scale_factor = head_dim ** -0.5
+        attn_logits = torch.matmul(
+            query.float(), key.float().transpose(-2, -1)
+        ) * scale_factor
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attn_logits = attn_logits + attention_mask
+
+        attention_probs = attn_logits.softmax(dim=-1)
+
+        # Capture text cross-attention (seq_len <= 77)
         if attention_probs.shape[-1] <= 77:
-            self.attn_map = attention_probs  # [B*F*heads, HW, seq_len]
+            # Reshape to [B*heads, HW, seq_len] for compatibility with loss computation
+            hw = attention_probs.shape[2]
+            seq_len = attention_probs.shape[3]
+            self.attn_map = attention_probs.reshape(
+                batch_size * attn.heads, hw, seq_len
+            )
 
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        # Apply attention to values (back to original dtype)
+        hidden_states = torch.matmul(attention_probs.to(value.dtype), value)
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, -1, attn.heads * head_dim
+        )
+        hidden_states = hidden_states.to(query.dtype)
 
+        # Linear proj + dropout
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
@@ -135,6 +248,8 @@ class VideoDCLGPipeline:
         self.pipe.requires_safety_checker = False
         self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.pipe.vae.enable_slicing()
+        # NOTE: Do NOT enable gradient_checkpointing — it recomputes forward during
+        # backward, overwriting stored attention maps and breaking the loss computation graph.
 
         # Register attention hooks
         self.hook_manager = VideoHookManager(
@@ -303,12 +418,16 @@ class VideoDCLGPipeline:
             # CFG: duplicate latents
             latent_input = torch.cat([latents] * 2)
             latent_input = self.pipe.scheduler.scale_model_input(latent_input, t)
+            # AnimateDiff UNet merges frames into batch dim internally.
+            # encoder_hidden_states must be repeated per frame so shapes align:
+            # [2, 77, 768] → [2*F, 77, 768]
             enc_hs = torch.cat([text_uncond, text_cond], dim=0).to(torch.float32)
+            enc_hs_rep = enc_hs.repeat_interleave(num_frames, dim=0)
 
             # UNet forward
             noise_pred_out = self.pipe.unet(
                 latent_input.to(self.pipe.unet.dtype), t,
-                encoder_hidden_states=enc_hs.to(self.pipe.unet.dtype),
+                encoder_hidden_states=enc_hs_rep.to(self.pipe.unet.dtype),
             ).sample.to(torch.float32)
 
             # CFG
@@ -317,6 +436,12 @@ class VideoDCLGPipeline:
 
             if apply_guidance:
                 captured = self.hook_manager.get_captured_maps()
+
+                if not captured:
+                    losses.append(0.0)
+                    latents = latents.detach()
+                    latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
+                    continue
 
                 if per_frame_loss:
                     loss = self.compute_per_frame_loss(
@@ -328,7 +453,17 @@ class VideoDCLGPipeline:
                     )
                 losses.append(loss.item())
 
-                grad = torch.autograd.grad(loss, latents)[0]
+                grad = torch.autograd.grad(loss, latents, allow_unused=True)[0]
+                if grad is None:
+                    print(f"    Step {i}: grad is None (no gradient flow)")
+                    latents = latents.detach()
+                    latents = self.pipe.scheduler.step(noise_pred, t, latents).prev_sample
+                    continue
+
+                grad_norm = grad.norm().item()
+                if i == 0 or i == tau_threshold - 1:
+                    print(f"    Step {i}: loss={loss.item():.4f}, grad_norm={grad_norm:.6f}")
+
                 if grad_clip:
                     grad = torch.clamp(grad, -grad_clip, grad_clip)
 
@@ -386,9 +521,10 @@ class VideoDCLGPipeline:
             latent_input = torch.cat([latents] * 2)
             latent_input = self.pipe.scheduler.scale_model_input(latent_input, t)
             enc_hs = torch.cat([text_uncond, text_cond], dim=0).to(torch.float32)
+            enc_hs_rep = enc_hs.repeat_interleave(num_frames, dim=0)
             self.pipe.unet(
                 latent_input.to(self.pipe.unet.dtype), t,
-                encoder_hidden_states=enc_hs.to(self.pipe.unet.dtype),
+                encoder_hidden_states=enc_hs_rep.to(self.pipe.unet.dtype),
             )
 
         captured = self.hook_manager.get_captured_maps()
